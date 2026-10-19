@@ -25,7 +25,9 @@ defmodule Bypass.Instance do
 
   def init([opts]) do
     # Get a free port from the OS
-    case :ranch_tcp.listen(so_reuseport() ++ [ip: listen_ip(), port: Keyword.get(opts, :port, 0)]) do
+    case :ranch_tcp.listen(%{
+           socket_opts: so_reuseport() ++ [ip: listen_ip(), port: Keyword.get(opts, :port, 0)]
+         }) do
       {:ok, socket} ->
         {:ok, port} = :inet.port(socket)
         :erlang.port_close(socket)
@@ -340,23 +342,21 @@ defmodule Bypass.Instance do
 
   defp do_up(port, ref) do
     plug_opts = [bypass_instance: self()]
-    {:ok, socket} = :ranch_tcp.listen(so_reuseport() ++ [ip: listen_ip(), port: port])
-    cowboy_opts = cowboy_opts(port, ref, socket)
-    {:ok, _pid} = Plug.Cowboy.http(Bypass.Plug, plug_opts, cowboy_opts)
-    socket
+
+    # ranch 2 no longer accepts a pre-opened `socket` transport option, so the
+    # listener owns its socket. The listener pid stands in for the socket in the
+    # state; `nil` still means "down".
+    {:ok, listener} = Plug.Cowboy.http(Bypass.Plug, plug_opts, cowboy_opts(port, ref))
+    listener
   end
 
-  defp do_down(ref, socket) do
+  defp do_down(ref, _listener) do
+    # `suspend_listener/1` synchronously terminates ranch's acceptors supervisor,
+    # which owns the listening socket, so the port is closed before we return.
+    # Relying on `Plug.Cowboy.shutdown/1` alone would race tests that expect the
+    # socket to be closed right after `down`.
+    _ = :ranch.suspend_listener(ref)
     :ok = Plug.Cowboy.shutdown(ref)
-
-    # `port_close` is synchronous, so after it has returned we _know_ that the socket has been
-    # closed. If we'd rely on ranch's supervisor shutting down the acceptor processes and thereby
-    # killing the socket we would run into race conditions where the socket port hasn't yet gotten
-    # the EXIT signal and would still be open, thereby breaking tests that rely on a closed socket.
-    case :erlang.port_info(socket, :name) do
-      :undefined -> :ok
-      _ -> :erlang.port_close(socket)
-    end
   end
 
   defp retain_plug_process({method, path} = route, {caller_pid, _}, state) do
@@ -438,8 +438,12 @@ defmodule Bypass.Instance do
     new_route(fun, build_path_match(path) |> elem(1), expected)
   end
 
-  defp cowboy_opts(port, ref, socket) do
-    [ref: ref, port: port, transport_options: [num_acceptors: 5, socket: socket]]
+  defp cowboy_opts(port, ref) do
+    [
+      ref: ref,
+      port: port,
+      transport_options: [num_acceptors: 5, socket_opts: so_reuseport() ++ [ip: listen_ip()]]
+    ]
   end
 
   # Use raw socket options to set SO_REUSEPORT so we fix {:error, :eaddrinuse} - where the OS errors
